@@ -27,7 +27,10 @@ namespace BidAskMarkets
 
         private const int year = 2026;
         private const int month = 6;
-        private const int day = 5;
+        private const int day = 4;
+
+        private static readonly DateTime start = new(year, month, day, 8, 0, 0);
+        private static readonly DateTime end = new(year, month, day, 15, 0, 0);
 
         public static async Task Run()
         {
@@ -42,22 +45,21 @@ namespace BidAskMarkets
 
         private static async Task DownloadLS()
         {
-            DateTime current = new(year, month, day, 7, 5, 0);
-            DateTime end = new(year, month, day, 15, 24, 0);
+            DateTime current = start;
 
             while (current != end)
             {
                 string timeStr = current.ToString("HHmmss");
 
-                string url = $"https://www.ls-x.de/_rpc/json/.lstc/instrument/list/lstcpretradesyesterday?time={timeStr}";
+                string url = $"https://www.ls-x.de/_rpc/json/.lstc/instrument/list/lstcpretradeyesterday?time={timeStr}";
                 int attempt = 0;
                 while (true)
                 {
                     try
                     {
-                        //Console.WriteLine($"Tentativo LS {attempt}");
                         using HttpResponseMessage response = await httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
                         response.EnsureSuccessStatusCode();
+                        Console.WriteLine($"Scaricato {url}");
                         using Stream stream = await response.Content.ReadAsStreamAsync();
                         using var reader = new StreamReader(stream);
                         string? line;
@@ -74,6 +76,7 @@ namespace BidAskMarkets
                         }
                         WriteOutput(LS, lsState);
                         current = current.AddMinutes(5);
+                        break;
                     }
                     catch (Exception ex)
                     {
@@ -93,8 +96,7 @@ namespace BidAskMarkets
 
         private static async Task DownloadEIX()
         {
-            DateTime current = new(year, month, day, 7, 5, 0);
-            DateTime end = new(year, month, day, 15, 24, 0);
+            DateTime current = start;
 
             while (current != end)
             {
@@ -112,6 +114,7 @@ namespace BidAskMarkets
                         //Console.WriteLine($"Tentativo EIX {attempt}");
                         using HttpResponseMessage response = await httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
                         response.EnsureSuccessStatusCode();
+                        Console.WriteLine($"Scaricato {url}");
                         using Stream stream = await response.Content.ReadAsStreamAsync();
                         using var reader = new StreamReader(stream);
                         string? line;
@@ -128,6 +131,7 @@ namespace BidAskMarkets
                         }
                         WriteOutput(EIX, eixState);
                         current = current.AddMinutes(5);
+                        break;
                     }
                     catch (Exception ex)
                     {
@@ -154,8 +158,7 @@ namespace BidAskMarkets
             string monthStr = month.ToString().PadLeft(2, '0');
             string dayStr = day.ToString().PadLeft(2, '0');
 
-            DateTime current = new(year, month, day, 7, 5, 0);
-            DateTime end = new(year, month, day, 15, 24, 0);
+            DateTime current = start;
 
             while (current != end)
             {
@@ -171,6 +174,7 @@ namespace BidAskMarkets
                         //Console.WriteLine($"Tentativo XETRA {attempt}");
                         using HttpResponseMessage response = await httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
                         response.EnsureSuccessStatusCode();
+                        Console.WriteLine($"Scaricato {url}");
                         using Stream stream = await response.Content.ReadAsStreamAsync();
                         using var gzip = new GZipStream(stream, CompressionMode.Decompress);
                         using var reader = new StreamReader(gzip);
@@ -188,6 +192,7 @@ namespace BidAskMarkets
                         }
                         WriteOutput(XETRA, xetraState);
                         current = current.AddMinutes(1);
+                        break;
                     }
                     catch (Exception ex)
                     {
@@ -347,19 +352,33 @@ namespace BidAskMarkets
                 {
                     newBid = bestBidProp.GetDouble();
                 }
-                else if (root.TryGetProperty("mdBidMktDepthGroup1", out JsonElement aggregatedBid))
+                else if (root.TryGetProperty("mdBidMktDepthGroup1", out JsonElement group))
                 {
-                    if (aggregatedBid.ValueKind == JsonValueKind.Array)
+                    if (group.ValueKind == JsonValueKind.Array)
                     {
-                        JsonElement first = aggregatedBid.EnumerateArray().FirstOrDefault();
-                        if (first.TryGetProperty("price", out JsonElement price))
+                        foreach (JsonElement groupElement in group.EnumerateArray())
                         {
-                            newBid = price.GetDouble();
+                            if (groupElement.TryGetProperty("price", out JsonElement price))
+                            {
+                                double bid = price.GetDouble();
+                                if (bid == 0.0)
+                                {
+                                    continue;
+                                }
+                                newBid = bid;
+                            }
+                            if (groupElement.TryGetProperty("quantity", out JsonElement quantity))
+                            {
+                                int bidQty = (int)Math.Round(quantity.GetDouble());
+                                if (bidQty == 0.0)
+                                {
+                                    continue;
+                                }
+                                newBidQty = bidQty;
+                            }
+                            break;
                         }
-                        if (first.TryGetProperty("quantity", out JsonElement quantity))
-                        {
-                            newBidQty = (int)Math.Round(quantity.GetDouble());
-                        }
+
                     }
                 }
 
@@ -367,18 +386,31 @@ namespace BidAskMarkets
                 {
                     newAsk = bestAskProp.GetDouble();
                 }
-                else if (root.TryGetProperty("mdAskMktDepthGroup1", out JsonElement aggregatedBid))
+                else if (root.TryGetProperty("mdAskMktDepthGroup1", out JsonElement group))
                 {
-                    if (aggregatedBid.ValueKind == JsonValueKind.Array)
+                    if (group.ValueKind == JsonValueKind.Array)
                     {
-                        JsonElement first = aggregatedBid.EnumerateArray().FirstOrDefault();
-                        if (first.TryGetProperty("price", out JsonElement price))
+                        foreach (JsonElement groupElement in group.EnumerateArray())
                         {
-                            newAsk = price.GetDouble();
-                        }
-                        if (first.TryGetProperty("quantity", out JsonElement quantity))
-                        {
-                            newAskQty = (int)Math.Round(quantity.GetDouble());
+                            if (groupElement.TryGetProperty("price", out JsonElement price))
+                            {
+                                double ask = price.GetDouble();
+                                if (ask == 0.0)
+                                {
+                                    continue;
+                                }
+                                newAsk = ask;
+                            }
+                            if (groupElement.TryGetProperty("quantity", out JsonElement quantity))
+                            {
+                                int askQty = (int)Math.Round(quantity.GetDouble());
+                                if (askQty == 0.0)
+                                {
+                                    continue;
+                                }
+                                newAskQty = askQty;
+                            }
+                            break;
                         }
                     }
                 }
@@ -444,7 +476,7 @@ namespace BidAskMarkets
             try
             {
                 var dt = FloorSecond(ParseTime(ts));
-                var entry = GetEntry(eixState, isin, dt);
+                var entry = GetEntry(lsState, isin, dt);
 
                 if (bid == null)
                     Console.WriteLine($"Bid {parts[4]} non parsabile in linea LS {line}");
@@ -552,12 +584,22 @@ namespace BidAskMarkets
                     var dt = pair.Key;
                     var entry = pair.Value;
 
-                    if (entry.Bid == null || entry.Ask == null || entry.BidQty == null || entry.AskQty == null)
+                    if (
+                        entry.Bid == null
+                        || entry.Bid == 0
+                        || entry.Ask == null
+                        || entry.Ask == 0
+                        || entry.BidQty == null
+                        || entry.BidQty == 0
+                        || entry.AskQty == null
+                        || entry.AskQty == 0
+                    )
                         continue;
 
                     writer.WriteLine($"{dt.ToString("o", CultureInfo.InvariantCulture)};{entry.Bid};{entry.Ask};{entry.BidQty};{entry.AskQty}");
                 }
             });
+            state.Clear();
         }
 
         private static string GetPath(string path) => $"C:\\repos\\BidAskMarkets\\data\\{path}";
