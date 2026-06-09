@@ -1,4 +1,5 @@
 ﻿using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO.Compression;
 using System.Text.Json;
@@ -27,13 +28,20 @@ namespace BidAskMarkets
 
         private const int year = 2026;
         private const int month = 6;
-        private const int day = 4;
+        private const int day = 8;
 
-        private static readonly DateTime start = new(year, month, day, 8, 0, 0);
+        private static readonly DateTime start = new(year, month, day, 11, 35, 0);
         private static readonly DateTime end = new(year, month, day, 15, 0, 0);
 
         public static async Task Run()
         {
+            await DownloadEIX();
+            return;
+
+            DeleteDataFolder(XETRA);
+            DeleteDataFolder(EIX);
+            DeleteDataFolder(LS);
+
             Task xetraTask = Task.Run(() => DownloadXetra());
 
             Task eixTask = Task.Run(() => DownloadEIX());
@@ -43,6 +51,26 @@ namespace BidAskMarkets
             Task.WaitAll([xetraTask, eixTask, lsTask]);
         }
 
+        private static bool DeleteDataFolder(string exchange)
+        {
+            string folderPath = GetPath(exchange);
+            if (!Directory.Exists(folderPath))
+            {
+                return true;
+            }
+            try
+            {
+                Directory.Delete(folderPath);
+                return true;
+            }
+            catch(Exception e)
+            {
+                Console.WriteLine($"Impossibile eliminare la directory {folderPath}:\n{e}");
+                return false;
+            }
+        }
+        
+
         private static async Task DownloadLS()
         {
             DateTime current = start;
@@ -51,7 +79,7 @@ namespace BidAskMarkets
             {
                 string timeStr = current.ToString("HHmmss");
 
-                string url = $"https://www.ls-x.de/_rpc/json/.lstc/instrument/list/lstcpretradeyesterday?time={timeStr}";
+                string url = $"https://www.ls-x.de/_rpc/json/.lstc/instrument/list/lsxpretrades?time={timeStr}";
                 int attempt = 0;
                 while (true)
                 {
@@ -83,7 +111,7 @@ namespace BidAskMarkets
                         var waitSeconds = attempt * 5;
 
                         Console.WriteLine(
-                            $"  Errore LS: {ex.Message}\n" +
+                            $"  Errore LS: {ex}\n" +
                             $"  Nuovo tentativo tra {waitSeconds} secondi..."
                         );
 
@@ -94,31 +122,31 @@ namespace BidAskMarkets
             }
         }
 
-        private static async Task DownloadEIX()
+       private static async Task DownloadEIX()
         {
             DateTime current = start;
 
             while (current != end)
             {
-
                 long currentMs = new DateTimeOffset(current, TimeSpan.Zero).ToUnixTimeMilliseconds();
                 string dateStr = current.ToString("yyyy-MM-dd");
                 string timeStr = current.ToString("HH.mm");
 
-                string url = $"https://european-investor-exchange.com/api/trade-file-contents?key=pretrade/{dateStr}/Pretrade.{currentMs}.csv&attachmentFilename=Pretrade_{dateStr}_{timeStr}.csv";
+                string url =
+                    $"https://european-investor-exchange.com/api/trade-file-contents?key=pretrade/{dateStr}/Pretrade.{currentMs}.csv&attachmentFilename=Pretrade_{dateStr}_{timeStr}.csv";
+
                 int attempt = 0;
+
                 while (true)
                 {
                     try
                     {
-                        //Console.WriteLine($"Tentativo EIX {attempt}");
-                        using HttpResponseMessage response = await httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+                        Console.WriteLine($"Tentativo EIX {attempt} download di {url}");
+                        using HttpResponseMessage response = await httpClient.GetAsync(url, HttpCompletionOption.ResponseContentRead);
                         response.EnsureSuccessStatusCode();
                         Console.WriteLine($"Scaricato {url}");
-                        using Stream stream = await response.Content.ReadAsStreamAsync();
-                        using var reader = new StreamReader(stream);
-                        string? line;
-                        while ((line = await reader.ReadLineAsync()) != null)
+                        string csv = await response.Content.ReadAsStringAsync();
+                        foreach (var line in csv.Split('\n'))
                         {
                             try
                             {
@@ -126,20 +154,22 @@ namespace BidAskMarkets
                             }
                             catch (Exception e)
                             {
-                                Console.WriteLine("Impossibile processare linea EIX:\n" + e.ToString());
+                                Console.WriteLine("Impossibile processare linea EIX:\n" + e);
                             }
                         }
+
                         WriteOutput(EIX, eixState);
+
                         current = current.AddMinutes(5);
                         break;
                     }
                     catch (Exception ex)
                     {
-                        var waitSeconds = attempt * 5;
+                        var waitSeconds = 5;
 
                         Console.WriteLine(
-                            $"  Errore EIX: {ex.Message}\n" +
-                            $"  Nuovo tentativo tra {waitSeconds} secondi..."
+                            $"Errore EIX: {ex}\n" +
+                            $"Nuovo tentativo tra {waitSeconds} secondi..."
                         );
 
                         await Task.Delay(waitSeconds * 1000);
@@ -151,9 +181,6 @@ namespace BidAskMarkets
 
         private static async Task DownloadXetra()
         {
-            string xetraFolder = GetPath(XETRA);
-            Directory.CreateDirectory(xetraFolder);
-
             string yearStr = year.ToString();
             string monthStr = month.ToString().PadLeft(2, '0');
             string dayStr = day.ToString().PadLeft(2, '0');
@@ -199,7 +226,7 @@ namespace BidAskMarkets
                         var waitSeconds = attempt * 5;
 
                         Console.WriteLine(
-                            $"  Errore XETRA: {ex.Message}\n" +
+                            $"  Errore XETRA: {ex}\n" +
                             $"  Nuovo tentativo tra {waitSeconds} secondi..."
                         );
 
@@ -213,7 +240,8 @@ namespace BidAskMarkets
         private static HashSet<string> ParseEtfIsins()
         {
             HashSet<string> etfIsins = [];
-            foreach (string line in File.ReadLines("C:\\repos\\BidAskMarkets\\data\\isins.txt"))
+            string isinsFilePath = GetPath("isins.txt");
+            foreach (string line in File.ReadLines(isinsFilePath))
             {
                 if (!string.IsNullOrEmpty(line))
                 {
@@ -602,6 +630,6 @@ namespace BidAskMarkets
             state.Clear();
         }
 
-        private static string GetPath(string path) => $"C:\\repos\\BidAskMarkets\\data\\{path}";
+        private static string GetPath(string path) => $"data/{path}";
     }
 }
