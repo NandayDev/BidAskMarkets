@@ -30,7 +30,7 @@ namespace BidAskMarkets
         private const int month = 6;
         private const int day = 8;
 
-        private static readonly DateTime start = new(year, month, day, 11, 35, 0);
+        private static readonly DateTime start = new(year, month, day, 12, 5, 0);
         private static readonly DateTime end = new(year, month, day, 15, 0, 0);
 
         public static async Task Run()
@@ -380,67 +380,10 @@ namespace BidAskMarkets
                 {
                     newBid = bestBidProp.GetDouble();
                 }
-                else if (root.TryGetProperty("mdBidMktDepthGroup1", out JsonElement group))
-                {
-                    if (group.ValueKind == JsonValueKind.Array)
-                    {
-                        foreach (JsonElement groupElement in group.EnumerateArray())
-                        {
-                            if (groupElement.TryGetProperty("price", out JsonElement price))
-                            {
-                                double bid = price.GetDouble();
-                                if (bid == 0.0)
-                                {
-                                    continue;
-                                }
-                                newBid = bid;
-                            }
-                            if (groupElement.TryGetProperty("quantity", out JsonElement quantity))
-                            {
-                                int bidQty = (int)Math.Round(quantity.GetDouble());
-                                if (bidQty == 0.0)
-                                {
-                                    continue;
-                                }
-                                newBidQty = bidQty;
-                            }
-                            break;
-                        }
-
-                    }
-                }
 
                 if (root.TryGetProperty("bestAsk", out var bestAskProp) && bestAskProp.ValueKind != JsonValueKind.Null)
                 {
                     newAsk = bestAskProp.GetDouble();
-                }
-                else if (root.TryGetProperty("mdAskMktDepthGroup1", out JsonElement group))
-                {
-                    if (group.ValueKind == JsonValueKind.Array)
-                    {
-                        foreach (JsonElement groupElement in group.EnumerateArray())
-                        {
-                            if (groupElement.TryGetProperty("price", out JsonElement price))
-                            {
-                                double ask = price.GetDouble();
-                                if (ask == 0.0)
-                                {
-                                    continue;
-                                }
-                                newAsk = ask;
-                            }
-                            if (groupElement.TryGetProperty("quantity", out JsonElement quantity))
-                            {
-                                int askQty = (int)Math.Round(quantity.GetDouble());
-                                if (askQty == 0.0)
-                                {
-                                    continue;
-                                }
-                                newAskQty = askQty;
-                            }
-                            break;
-                        }
-                    }
                 }
 
                 if (root.TryGetProperty("bestBidQty", out var bestBidQtyProp) && bestBidQtyProp.ValueKind != JsonValueKind.Null)
