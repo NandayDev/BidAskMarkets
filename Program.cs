@@ -1,377 +1,576 @@
 ﻿using System.Collections.Concurrent;
 using System.Globalization;
-using System.Text.RegularExpressions;
+using System.IO.Compression;
+using System.Text.Json;
 
 namespace BidAskMarkets
 {
     public partial class Program
     {
-        private static readonly HashSet<string> biggestEtfsIsins = ["IE00B5BMR087", "IE00B4L5Y983", "IE00B3XXRP09", "IE00BK5BQT80", "IE00BKM4GZ66", "IE00B3YCGJ38", "IE00B4ND3602", "IE00B53SZB19", "IE00B3RBWM25", "DE000A0S9GB0", "LU0290358497", "LU0908500753"];
+        private static readonly HttpClient httpClient = new();
+
+        private const string XETRA = "xetra";
+        private const string LS = "ls";
+        private const string EIX = "eix";
+
+        private static readonly ConcurrentDictionary<string, ConcurrentDictionary<DateTime, Entry>> xetraState
+            = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly ConcurrentDictionary<string, ConcurrentDictionary<DateTime, Entry>> lsState
+            = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly ConcurrentDictionary<string, ConcurrentDictionary<DateTime, Entry>> eixState
+            = new(StringComparer.OrdinalIgnoreCase);
+
+        private static readonly HashSet<string> etfIsins = ParseEtfIsins();
+
+        private static readonly ConcurrentDictionary<string, Entry> xetraLastEntry = [];
+
+        private const int year = 2026;
+        private const int month = 6;
+        private const int day = 8;
+
+        private static readonly DateTime start = new(year, month, day, 8, 0, 0);
+        private static readonly DateTime end = new(year, month, day, 15, 0, 0);
 
         public static async Task Main(string[] args)
         {
-            Console.WriteLine("Inserisci un isin specifico di un ETF, o lascia vuoto per fare l'analisi completa:");
-            string? isin = Console.ReadLine();
+            // DeleteDataFolder(XETRA);
+            // DeleteDataFolder(EIX);
+            // DeleteDataFolder(LS);
 
-            try
-            {
-                if (string.IsNullOrEmpty(isin))
-                {
-                    await Filter.Run();
-                    //await Run();
-                }
-                else
-                {
-                    RunForSingleETF(isin);
-                }
-            }
-            catch (Exception e)
-            {
-                Console.WriteLine("Errore: " + e.ToString());
-            }
+            Task xetraTask = Task.Run(() => DownloadXetra());
+
+            Task eixTask = Task.Run(() => DownloadEIX());
+
+            Task lsTask = Task.Run(() => DownloadLS());
+
+            Task.WaitAll([xetraTask, eixTask, lsTask]);
 
             Console.WriteLine("Premi qualsiasi pulsante per uscire.");
             Console.ReadLine();
         }
 
-        private static async Task Run()
+        private static bool DeleteDataFolder(string exchange)
         {
-            var lsDictionaryTask = GetSpreadsAsync("ls");
-            var xetraDictionaryTask = GetSpreadsAsync("xetra");
-            var eixDictionaryTask = GetSpreadsAsync("eix");
-
-            Dictionary<string, SpreadData> lsDictionary = await lsDictionaryTask;
-            Dictionary<string, SpreadData> xetraDictionary = await xetraDictionaryTask;
-            Dictionary<string, SpreadData> eixDictionary = await eixDictionaryTask;
-
-            double xetraEixAverageSum = 0;
-            double xetraLsAverageSum = 0;
-            int xetraEixAverageCount = 0;
-            int xetraLsAverageCount = 0;
-            foreach (string key in xetraDictionary.Keys)
+            string folderPath = GetPath(exchange);
+            if (!Directory.Exists(folderPath))
             {
-                SpreadData xetra = xetraDictionary[key];
-                if (eixDictionary.TryGetValue(key, out SpreadData? eix))
-                {
-                    double xetraEixAverage = eix.Average() - xetra.Average();
-                    xetraEixAverageSum += xetraEixAverage;
-                    xetraEixAverageCount++;
+                return true;
+            }
+            try
+            {
+                Directory.Delete(folderPath);
+                return true;
+            }
+            catch(Exception e)
+            {
+                Console.WriteLine($"Impossibile eliminare la directory {folderPath}:\n{e}");
+                return false;
+            }
+        }
+        
 
-                    if (lsDictionary.TryGetValue(key, out SpreadData? ls))
+        private static async Task DownloadLS()
+        {
+            DateTime current = start;
+
+            while (current != end)
+            {
+                string timeStr = current.ToString("HHmmss");
+
+                string url = $"https://www.ls-x.de/_rpc/json/.lstc/instrument/list/lsxpretrades?time={timeStr}";
+                int attempt = 0;
+                while (true)
+                {
+                    try
                     {
-                        double xetraLsAverage = ls.Average() - xetra.Average();
-                        xetraLsAverageSum += xetraLsAverage;
-                        xetraLsAverageCount++;
-                        if (biggestEtfsIsins.Contains(key))
+                        using HttpResponseMessage response = await httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+                        response.EnsureSuccessStatusCode();
+                        Console.WriteLine($"Scaricato {url}");
+                        using Stream stream = await response.Content.ReadAsStreamAsync();
+                        using var reader = new StreamReader(stream);
+                        string? line;
+                        while ((line = await reader.ReadLineAsync()) != null)
                         {
-                            Console.WriteLine($"{key}:");
-                            PrintResult(xetra, "XETRA");
-                            PrintResult(eix, "EIX");
-                            PrintResult(ls, "LS");
-                            Console.WriteLine($"Differenza Xetra-EIX media: {xetraEixAverage.Format()}%");
-                            Console.WriteLine($"Differenza Xetra-LS media: {xetraLsAverage.Format()}%");
-                            Console.WriteLine();
+                            try
+                            {
+                                ProcessLsLine(line);
+                            }
+                            catch (Exception e)
+                            {
+                                Console.WriteLine("Impossibile processare linea LS:\n" + e.ToString());
+                            }
                         }
+                        WriteOutput(LS, lsState);
+                        current = current.AddMinutes(5);
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        var waitSeconds = attempt * 5;
+
+                        Console.WriteLine(
+                            $"  Errore LS: {ex}\n" +
+                            $"  Nuovo tentativo tra {waitSeconds} secondi..."
+                        );
+
+                        await Task.Delay(waitSeconds * 1000);
+                        attempt++;
                     }
                 }
             }
-
-            Console.WriteLine();
-            Console.WriteLine("-------------------");
-            Console.WriteLine();
-            Console.WriteLine("Risultati aggregati:");
-            double xetraEixAverageDifference = xetraEixAverageSum / xetraEixAverageCount;
-            double xetraLsAverageDifference = xetraLsAverageSum / xetraLsAverageCount;
-            Console.WriteLine($"Differenza media tra XETRA ed EIX: {xetraEixAverageDifference.Format()}%");
-            Console.WriteLine($"Differenza media tra XETRA ed LS: {xetraLsAverageDifference.Format()}%");
         }
 
-        private static void RunForSingleETF(string isin)
+       private static async Task DownloadEIX()
         {
-            Dictionary<string, SpreadData> lsDictionary = [];
-            Dictionary<string, SpreadData> eixDictionary = [];
-            Dictionary<string, SpreadData> xetraDictionary = [];
+            DateTime current = start;
 
-            GetSpreads(lsDictionary, $"C:\\repos\\BidAskMarkets\\data\\ls_filtrato\\{isin}.txt", isin);
-            GetSpreads(eixDictionary, $"C:\\repos\\BidAskMarkets\\data\\eix_filtrato\\{isin}.txt", isin);
-            GetSpreads(xetraDictionary, $"C:\\repos\\BidAskMarkets\\data\\xetra_filtrato\\{isin}.txt", isin);
-
-            SpreadData xetra = xetraDictionary[isin];
-            if (eixDictionary.TryGetValue(isin, out SpreadData? eix))
+            while (current != end)
             {
-                double xetraEixAverage = eix.Average() - xetra.Average();
+                long currentMs = new DateTimeOffset(current, TimeSpan.Zero).ToUnixTimeMilliseconds();
+                string dateStr = current.ToString("yyyy-MM-dd");
+                string timeStr = current.ToString("HH.mm");
 
-                if (lsDictionary.TryGetValue(isin, out SpreadData? ls))
+                string url =
+                    $"https://european-investor-exchange.com/api/trade-file-contents?key=pretrade/{dateStr}/Pretrade.{currentMs}.csv&attachmentFilename=Pretrade_{dateStr}_{timeStr}.csv";
+
+                int attempt = 0;
+
+                while (true)
                 {
-                    double xetraLsAverage = ls.Average() - xetra.Average();
-                    Console.WriteLine();
-                    PrintResult(xetra, "XETRA");
-                    PrintResult(eix, "EIX");
-                    PrintResult(ls, "LS");
-                    Console.WriteLine($"Differenza Xetra-EIX media: {xetraEixAverage.Format()}%");
-                    Console.WriteLine($"Differenza Xetra-LS media: {xetraLsAverage.Format()}%");
-                    Console.WriteLine();
+                    try
+                    {
+                        Console.WriteLine($"Tentativo EIX {attempt} download di {url}");
+                        using HttpResponseMessage response = await httpClient.GetAsync(url, HttpCompletionOption.ResponseContentRead);
+                        response.EnsureSuccessStatusCode();
+                        Console.WriteLine($"Scaricato {url}");
+                        string csv = await response.Content.ReadAsStringAsync();
+                        foreach (var line in csv.Split('\n'))
+                        {
+                            try
+                            {
+                                ProcessEixLine(line);
+                            }
+                            catch (Exception e)
+                            {
+                                Console.WriteLine("Impossibile processare linea EIX:\n" + e);
+                            }
+                        }
+
+                        WriteOutput(EIX, eixState);
+
+                        current = current.AddMinutes(5);
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        var waitSeconds = 5;
+
+                        Console.WriteLine(
+                            $"Errore EIX: {ex}\n" +
+                            $"Nuovo tentativo tra {waitSeconds} secondi..."
+                        );
+
+                        await Task.Delay(waitSeconds * 1000);
+                        attempt++;
+                    }
                 }
             }
         }
 
-
-        private static void PrintResult(SpreadData result, string name)
+        private static async Task DownloadXetra()
         {
-            Console.WriteLine($"Spread {name}: Medio: {result.Average().Format()}% - Minimo: {result.Min.Format()}% - Massimo: {result.Max.Format()}%");
+            string yearStr = year.ToString();
+            string monthStr = month.ToString().PadLeft(2, '0');
+            string dayStr = day.ToString().PadLeft(2, '0');
+
+            DateTime current = start;
+
+            while (current != end)
+            {
+                //https://mfs.deutsche-boerse.com/api/download/DETR-pretrade-2026-06-05T20_50.json.gz
+                string hourStr = current.Hour.ToString().PadLeft(2, '0');
+                string minutesStr = current.Minute.ToString().PadLeft(2, '0');
+                string url = $"https://mfs.deutsche-boerse.com/api/download/DETR-pretrade-{yearStr}-{monthStr}-{dayStr}T{hourStr}_{minutesStr}.json.gz";
+                int attempt = 0;
+                while (true)
+                {
+                    try
+                    {
+                        //Console.WriteLine($"Tentativo XETRA {attempt}");
+                        using HttpResponseMessage response = await httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+                        response.EnsureSuccessStatusCode();
+                        Console.WriteLine($"Scaricato {url}");
+                        using Stream stream = await response.Content.ReadAsStreamAsync();
+                        using var gzip = new GZipStream(stream, CompressionMode.Decompress);
+                        using var reader = new StreamReader(gzip);
+                        string? line;
+                        while ((line = await reader.ReadLineAsync()) != null)
+                        {
+                            try
+                            {
+                                ProcessXetraLine(line);
+                            }
+                            catch (Exception e)
+                            {
+                                Console.WriteLine("Impossibile processare linea Xetra:\n" + e.ToString());
+                            }
+                        }
+                        WriteOutput(XETRA, xetraState);
+                        current = current.AddMinutes(1);
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        var waitSeconds = attempt * 5;
+
+                        Console.WriteLine(
+                            $"  Errore XETRA: {ex}\n" +
+                            $"  Nuovo tentativo tra {waitSeconds} secondi..."
+                        );
+
+                        await Task.Delay(waitSeconds * 1000);
+                        attempt++;
+                    }
+                }
+            }
         }
 
-        private static readonly CultureInfo cultureInfo = new("it-IT");
-
-        private static Task<Dictionary<string, SpreadData>> GetSpreadsAsync(string folderName)
+        private static HashSet<string> ParseEtfIsins()
         {
-            return Task.Run(delegate
+            HashSet<string> etfIsins = [];
+            string isinsFilePath = GetPath("isins.txt");
+            foreach (string line in File.ReadLines(isinsFilePath))
             {
-                Dictionary<string, SpreadData> spreadPercentages = [];
-                foreach (string file in Directory.EnumerateFiles($"C:\\repos\\BidAskMarkets\\data\\{folderName}\\"))
+                if (!string.IsNullOrEmpty(line))
                 {
-                    string isin = Path.GetFileNameWithoutExtension(file);
-                    GetSpreads(spreadPercentages, file, isin);
+                    etfIsins.Add(line.Trim());
+                }
+            }
+            return etfIsins;
+        }
+
+        // -----------------------------
+        // Modello dati
+        // -----------------------------
+        private class Entry
+        {
+            public double? Bid;
+            public double? Ask;
+            public int? BidQty;
+            public int? AskQty;
+
+            public Entry Copy() => new()
+            {
+                Bid = Bid,
+                Ask = Ask,
+                BidQty = BidQty,
+                AskQty = AskQty,
+            };
+
+            public bool IsSame(Entry other)
+            {
+                return Bid == other.Bid && Ask == other.Ask && BidQty == other.BidQty && AskQty == other.AskQty;
+            }
+        }
+
+        // -----------------------------
+        // Utilità
+        // -----------------------------
+        private static DateTime ParseTime(string ts)
+        {
+            // Gestisce ISO con eventuale 'Z'
+            ts = ts.Replace("Z", "+00:00");
+            return DateTime.Parse(ts, null, DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal);
+        }
+
+        private static DateTime FloorSecond(DateTime dt)
+        {
+            return new DateTime(dt.Year, dt.Month, dt.Day, dt.Hour, dt.Minute, dt.Second, DateTimeKind.Utc);
+        }
+
+        private static double? SafeFloat(string s)
+        {
+            if (double.TryParse(s, NumberStyles.Any, CultureInfo.InvariantCulture, out var v))
+                return v;
+            return null;
+        }
+
+        private static int? SafeInt(string s)
+        {
+            if (double.TryParse(s, NumberStyles.Any, CultureInfo.InvariantCulture, out var v))
+                return (int)Math.Round(v);
+            return null;
+        }
+
+        private static ConcurrentDictionary<DateTime, Entry> GetInstrumentState(
+            ConcurrentDictionary<string, ConcurrentDictionary<DateTime, Entry>> state,
+            string instr)
+        {
+            return state.GetOrAdd(instr, _ => new ConcurrentDictionary<DateTime, Entry>());
+        }
+
+        private static Entry GetEntry(
+            ConcurrentDictionary<string, ConcurrentDictionary<DateTime, Entry>> state,
+            string instr,
+            DateTime dt)
+        {
+            var instrState = GetInstrumentState(state, instr);
+            return instrState.GetOrAdd(dt, _ => new Entry());
+        }
+
+        // -----------------------------
+        // XETRA (JSON DELTA FEED)
+        // -----------------------------
+        private static void ProcessXetraLine(string line)
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(line);
+                var root = doc.RootElement;
+
+                if (!root.TryGetProperty("instrumentIdentificationCode", out var instrProp))
+                {
+                    Console.WriteLine("Linea XETRA senza strumento:\n" + line);
+                    return;
                 }
 
-                return spreadPercentages;
+                var isin = instrProp.GetString();
+
+                if (string.IsNullOrEmpty(isin))
+                {
+                    Console.WriteLine("Linea XETRA senza ISIN:\n" + line);
+                    return;
+                }
+
+                if (!etfIsins.Contains(isin))
+                {
+                    return;
+                }
+
+                if (!root.TryGetProperty("updateDateAndTime", out JsonElement tsProp))
+                {
+                    if (!root.TryGetProperty("mdupdateDateAndTime", out tsProp))
+                    {
+                        Console.WriteLine("Linea XETRA senza TS:\n" + line);
+                        return;
+                    }
+                }
+
+                var ts = tsProp.GetString();
+                if (string.IsNullOrEmpty(ts))
+                {
+                    Console.WriteLine("Linea XETRA senza TS:\n" + line);
+                    return;
+                }
+
+                DateTime dt = FloorSecond(ParseTime(ts));
+                ConcurrentDictionary<DateTime, Entry> instrState = GetInstrumentState(xetraState, isin);
+                Entry entry = instrState.GetOrAdd(dt, _ => xetraLastEntry.GetValueOrDefault(isin)?.Copy() ?? new Entry());
+
+                xetraLastEntry[isin] = entry;
+
+                double? newBid = null;
+                int? newBidQty = null;
+                double? newAsk = null;
+                int? newAskQty = null;
+
+                if (root.TryGetProperty("bestBid", out JsonElement bestBidProp) && bestBidProp.ValueKind != JsonValueKind.Null)
+                {
+                    newBid = bestBidProp.GetDouble();
+                }
+
+                if (root.TryGetProperty("bestAsk", out var bestAskProp) && bestAskProp.ValueKind != JsonValueKind.Null)
+                {
+                    newAsk = bestAskProp.GetDouble();
+                }
+
+                if (root.TryGetProperty("bestBidQty", out var bestBidQtyProp) && bestBidQtyProp.ValueKind != JsonValueKind.Null)
+                {
+                    newBidQty = (int)Math.Round(bestBidQtyProp.GetDouble());
+                }
+
+                if (root.TryGetProperty("bestAskQty", out var bestAskQtyProp) && bestAskQtyProp.ValueKind != JsonValueKind.Null)
+                {
+                    newAskQty = (int)Math.Round(bestAskQtyProp.GetDouble());
+                }
+
+                if (newBid.HasValue)
+                {
+                    entry.Bid = newBid.Value;
+                }
+                if (newAsk.HasValue)
+                {
+                    entry.Ask = newAsk;
+                }
+                if (newBidQty.HasValue)
+                {
+                    entry.BidQty = newBidQty.Value;
+                }
+                if (newAskQty.HasValue)
+                {
+                    entry.AskQty = newAskQty.Value;
+                }
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine($"Linea XETRA invalida:{e}\n{line}");
+            }
+        }
+
+        private static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
+        private static readonly NumberStyles NumStyle = NumberStyles.Float;
+
+        private static void ProcessLsLine(string line)
+        {
+            var parts = line.Trim().Replace("\"", "").Split(';');
+            if (parts.Length < 6)
+            {
+                Console.WriteLine("Linea LS invalida:\n" + line);
+                return;
+            }
+
+            var isin = parts[0];
+            if (!etfIsins.Contains(isin))
+            {
+                return;
+            }
+            var ts = parts[5];
+
+
+            var bid = SafeFloat(parts[1]);
+            var ask = SafeFloat(parts[2]);
+            var bidQty = SafeInt(parts[3]);
+            var askQty = SafeInt(parts[4]);
+
+            try
+            {
+                var dt = FloorSecond(ParseTime(ts));
+                var entry = GetEntry(lsState, isin, dt);
+
+                if (bid == null)
+                    Console.WriteLine($"Bid {parts[4]} non parsabile in linea LS {line}");
+                else
+                    entry.Bid = bid;
+
+                if (ask == null)
+                    Console.WriteLine($"Ask {parts[5]} non parsabile in linea LS {line}");
+                else
+                    entry.Ask = ask;
+
+                if (bidQty == null)
+                    Console.WriteLine($"BidQty {parts[2]} non parsabile in linea LS {line}");
+                else
+                    entry.BidQty = bidQty;
+
+                if (askQty == null)
+                    Console.WriteLine($"AskQty {parts[3]} non parsabile in linea LS {line}");
+                else
+                    entry.AskQty = askQty;
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine($"Linea LS errore: {e.Message}\n{line}");
+            }
+        }
+
+        // -----------------------------
+        // EIX (comma snapshot)
+        // -----------------------------
+        private static void ProcessEixLine(string line)
+        {
+            var p = line.Trim().Split(',');
+            if (p.Length < 7)
+            {
+                Console.WriteLine("Linea EIX invalida:\n" + line);
+                return;
+            }
+
+            var isin = p[1];
+            if (!etfIsins.Contains(isin))
+            {
+                return;
+            }
+
+            var ts = p[0];
+
+            var bidQty = SafeInt(p[2]);
+            var askQty = SafeInt(p[3]);
+            var bid = SafeFloat(p[4]);
+            var ask = SafeFloat(p[5]);
+
+            try
+            {
+                var dt = FloorSecond(ParseTime(ts));
+                var entry = GetEntry(eixState, isin, dt);
+
+                if (bid == null)
+                    Console.WriteLine($"Bid {p[4]} non parsabile in linea EIX {line}");
+                else
+                    entry.Bid = bid;
+
+                if (ask == null)
+                    Console.WriteLine($"Ask {p[5]} non parsabile in linea EIX {line}");
+                else
+                    entry.Ask = ask;
+
+                if (bidQty == null)
+                    Console.WriteLine($"BidQty {p[2]} non parsabile in linea EIX {line}");
+                else
+                    entry.BidQty = bidQty;
+
+                if (askQty == null)
+                    Console.WriteLine($"AskQty {p[3]} non parsabile in linea EIX {line}");
+                else
+                    entry.AskQty = askQty;
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine($"Linea EIX errore: {e.Message}\n{line}");
+            }
+        }
+
+        private static void WriteOutput(
+            string name,
+            ConcurrentDictionary<string, ConcurrentDictionary<DateTime, Entry>> state)
+        {
+            Console.WriteLine($"Writing {name} output");
+            var outDir = name;
+            string path = GetPath(outDir);
+            Directory.CreateDirectory(path);
+
+            // Parallelizza per strumento, ma ogni file è indipendente
+            Parallel.ForEach(state, kv =>
+            {
+                var instr = kv.Key;
+                var times = kv.Value;
+
+                var outFile = Path.Combine(path, $"{instr}.txt");
+
+                // Scrittura sequenziale per file (ma i file sono diversi tra loro)
+                using var writer = new StreamWriter(outFile, append: true);
+                foreach (var pair in times.OrderBy(p => p.Key))
+                {
+                    var dt = pair.Key;
+                    var entry = pair.Value;
+
+                    if (
+                        entry.Bid == null
+                        || entry.Bid == 0
+                        || entry.Ask == null
+                        || entry.Ask == 0
+                        || entry.BidQty == null
+                        || entry.BidQty == 0
+                        || entry.AskQty == null
+                        || entry.AskQty == 0
+                    )
+                        continue;
+
+                    writer.WriteLine($"{dt.ToString("o", CultureInfo.InvariantCulture)};{entry.Bid};{entry.Ask};{entry.BidQty};{entry.AskQty}");
+                }
             });
+            state.Clear();
         }
 
-        private static void GetSpreads(Dictionary<string, SpreadData> spreadPercentages, string file, string isin)
-        {
-            foreach (string line in File.ReadLines(file))
-            {
-                string[] elements = line.Split(';');
-
-                if (!spreadPercentages.TryGetValue(isin, out SpreadData? spreadData))
-                {
-                    spreadData = new SpreadData(isin);
-                    spreadPercentages[isin] = spreadData;
-                }
-                if (double.TryParse(elements[1], cultureInfo, out double bid))
-                {
-                    if (double.TryParse(elements[2], cultureInfo, out double ask))
-                    {
-                        if (ask == 0.0 || bid == 0.0)
-                        {
-                            continue;
-                        }
-                        double spread = ask - bid;
-                        if (spread <= 0)
-                        {
-                            continue;
-                        }
-                        double spreadPercentage = spread / ((ask + bid) / 2);
-                        spreadData.Update(spreadPercentage);
-                    }
-                }
-            }
-        }
-
-        [GeneratedRegex("\"bestAsk\":([^,\"]+)")]
-        private static partial Regex BestAskRegex();
-
-        [GeneratedRegex("\"bestBid\":([^,\"]+)")]
-        private static partial Regex BestBidRegex();
-
-        [GeneratedRegex("\"instrumentIdentificationCode\":\"([^\"]+)\"")]
-        private static partial Regex IsinRegex();
-
-        private static Dictionary<string, SpreadData> Xetra()
-        {
-            string xetraDirectory = "C:\\repos\\BidAskMarkets\\data\\xetra";
-            Regex isinRegex = IsinRegex();
-            Regex bidRegex = BestBidRegex();
-            Regex askRegex = BestAskRegex();
-
-            ConcurrentDictionary<string, SpreadData> spreadDataDict = [];
-            List<Task> tasks = [];
-
-            foreach (string file in Directory.EnumerateFiles(xetraDirectory))
-            {
-                Task task = Task.Run(delegate
-                {
-                    foreach (string line in File.ReadLines(file))
-                    {
-                        string? isin = isinRegex.Matches(line).FirstOrDefault()?.Groups[1].Value;
-
-                        if (isin == null)
-                        {
-                            continue;
-                        }
-
-                        if (!isin.StartsWith("IE") && !isin.StartsWith("LU"))
-                        {
-                            continue;
-                        }
-
-                        if (!spreadDataDict.TryGetValue(isin, out SpreadData? spreadData))
-                        {
-                            spreadData = new SpreadData(isin);
-                            spreadDataDict[isin] = spreadData;
-                        }
-
-                        string? bidString = bidRegex.Matches(line).FirstOrDefault()?.Groups[1].Value;
-                        double? bid = null;
-                        if (bidString != null)
-                        {
-                            bid = double.Parse(bidString, CultureInfo.InvariantCulture);
-                        }
-
-                        string? askString = askRegex.Matches(line).FirstOrDefault()?.Groups[1].Value;
-                        double? ask = null;
-                        if (askString != null)
-                        {
-                            ask = double.Parse(askString, CultureInfo.InvariantCulture);
-                        }
-
-                        if (bid.HasValue)
-                        {
-                            if (ask.HasValue)
-                            {
-                                double spread = ask.Value - bid.Value;
-                                if (spread == 0)
-                                {
-                                    continue;
-                                }
-                                double spreadPercentage = spread / ((ask.Value + bid.Value) / 2);
-                                spreadData.Update(spreadPercentage);
-                            }
-                        }
-                    }
-                });
-
-                tasks.Add(task);
-
-            }
-
-            Task.WaitAll(tasks);
-
-            return spreadDataDict.ToDictionary();
-        }
-
-        private static Dictionary<string, SpreadData> EIX()
-        {
-            ConcurrentDictionary<string, SpreadData> spreadPercentages = [];
-            List<Task> tasks = [];
-
-            foreach (string file in Directory.EnumerateFiles("C:\\repos\\BidAskMarkets\\data\\eix\\"))
-            {
-                Task task = Task.Run(delegate
-                {
-                    foreach (string line in File.ReadLines(file))
-                    {
-                        string[] elements = line.Split(',');
-                        string isin = elements[1];
-                        if (!spreadPercentages.TryGetValue(isin, out SpreadData? spreadData))
-                        {
-                            spreadData = new SpreadData(isin);
-                            spreadPercentages[isin] = spreadData;
-                        }
-                        if (double.TryParse(elements[4], CultureInfo.InvariantCulture, out double bid))
-                        {
-                            if (double.TryParse(elements[5], CultureInfo.InvariantCulture, out double ask))
-                            {
-                                double spread = ask - bid;
-                                if (spread == 0)
-                                {
-                                    continue;
-                                }
-                                double spreadPercentage = spread / ((ask + bid) / 2);
-                                spreadData.Update(spreadPercentage);
-                            }
-                        }
-                    }
-                });
-                tasks.Add(task);
-            }
-
-            Task.WaitAll(tasks);
-
-            return spreadPercentages.ToDictionary();
-        }
-
-
-        private static Dictionary<string, SpreadData> LS()
-        {
-            ConcurrentDictionary<string, SpreadData> spreadPercentages = [];
-            List<Task> tasks = [];
-
-            foreach (string file in Directory.EnumerateFiles("C:\\repos\\BidAskMarkets\\data\\ls\\"))
-            {
-                Task task = Task.Run(delegate
-                {
-                    foreach (string line in File.ReadLines(file))
-                    {
-                        string[] elements = line.Split(';');
-                        string isin = elements[0];
-
-                        if (!spreadPercentages.TryGetValue(isin, out SpreadData? spreadData))
-                        {
-                            spreadData = new SpreadData(isin);
-                            spreadPercentages[isin] = spreadData;
-                        }
-                        if (double.TryParse(elements[1], CultureInfo.InvariantCulture, out double bid))
-                        {
-                            if (double.TryParse(elements[2], CultureInfo.InvariantCulture, out double ask))
-                            {
-                                double spread = ask - bid;
-                                if (spread == 0)
-                                {
-                                    continue;
-                                }
-                                double spreadPercentage = spread / ((ask + bid) / 2);
-                                spreadData.Update(spreadPercentage);
-                            }
-                        }
-                    }
-                });
-                tasks.Add(task);
-            }
-
-            Task.WaitAll(tasks);
-
-            return spreadPercentages.ToDictionary();
-        }
-
-
-    }
-
-    public static class DoubleExtensions
-    {
-        private const int decimals = 4;
-
-        public static string Format(this double value)
-        {
-            return (value * 100.0).ToString($"0.{new string('#', decimals)}", CultureInfo.InvariantCulture);
-        }
-    }
-
-    public class SpreadData(string isin)
-    {
-        public string Isin { get; } = isin;
-
-        public double Sum = 0.0;
-        public int Count = 0;
-        public double Min = double.MaxValue;
-        public double Max = double.MinValue;
-
-        public void Update(double newSpread)
-        {
-            Sum += newSpread;
-            Count++;
-            Min = Math.Min(Min, newSpread);
-            Max = Math.Max(Max, newSpread);
-        }
-
-        public double Average()
-        {
-            if (Count == 0)
-            {
-                return 0.0;
-            }
-            return Sum / Count;
-        }
+        private static string GetPath(string path) => $"data/{path}";
     }
 }
